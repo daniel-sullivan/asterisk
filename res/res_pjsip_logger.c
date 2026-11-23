@@ -42,7 +42,8 @@
 #include "asterisk/acl.h"
 #include "asterisk/uuid.h"
 
-#define CAPTURE_MAX_MS 60000
+/* Only guards int64 overflow of the monotonic deadline; the operator's deadline bounds the lease. */
+#define CAPTURE_MAX_MS (INT64_MAX / 1000000LL / 2)
 #define NSEC_PER_MS 1000000LL
 
 /* Separate from the normal logger. All fields are under its session lock. */
