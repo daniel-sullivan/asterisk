@@ -507,8 +507,9 @@ static pj_bool_t logging_on_rx_msg(pjsip_rx_data *rdata)
 	if (!rdata->msg_info.msg) {
 		return PJ_FALSE;
 	}
+	/* A TLS read can contain several SIP messages; capture the parsed slice. */
 	capture_packet(rdata->msg_info.msg, rdata->tp_info.transport, rdata->pkt_info.src_name,
-		rdata->pkt_info.packet, rdata->msg_info.len, &rdata->pkt_info.src_addr, NULL);
+		rdata->msg_info.msg_buf, rdata->msg_info.len, &rdata->pkt_info.src_addr, NULL);
 
 	ao2_rdlock(default_logger);
 	if (!pjsip_log_test_filter(default_logger, rdata->pkt_info.src_name, rdata->pkt_info.src_port, &rdata->msg_info.msg->line.req.method)) {
