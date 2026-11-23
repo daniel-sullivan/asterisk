@@ -162,6 +162,7 @@ static int capture_open_pcap(const char *filename)
 	if (fchmod(fd, S_IRUSR | S_IWUSR)
 		|| write(fd, &pjsip_pcap_header, sizeof(pjsip_pcap_header)) != sizeof(pjsip_pcap_header)) {
 		close(fd);
+		unlink(filename);
 		return -1;
 	}
 	return fd;
@@ -439,7 +440,7 @@ static void capture_packet(pjsip_msg *sip, pjsip_transport *transport, const cha
 	struct ast_sockaddr peer;
 	const pjsip_method *method;
 
-	/* TLS only, and only the INVITE transactions needed for failover. */
+	/* Secure transports (TLS/WSS) only, and only the INVITE transactions needed for failover. */
 	if (!sip || !transport || !(transport->flag & PJSIP_TRANSPORT_SECURE) || !len) {
 		return;
 	}
@@ -508,7 +509,7 @@ static pj_bool_t logging_on_rx_msg(pjsip_rx_data *rdata)
 	if (!rdata->msg_info.msg) {
 		return PJ_FALSE;
 	}
-	/* A TLS read can contain several SIP messages; capture the parsed slice. */
+	/* A secure-transport read can contain several SIP messages; capture the parsed slice. */
 	capture_packet(rdata->msg_info.msg, rdata->tp_info.transport, rdata->pkt_info.src_name,
 		rdata->msg_info.msg_buf, rdata->msg_info.len, &rdata->pkt_info.src_addr, NULL);
 
@@ -954,8 +955,10 @@ static char *pjsip_capture_command(struct ast_cli_entry *e, int cmd, struct ast_
 			"       pjsip capture lease start <nonce> <new-absolute-pcap-path> <cidr[,cidr...]>\n"
 			"       pjsip capture lease cancel <nonce>\n"
 			"       pjsip capture lease status\n"
-			"       Capture decrypted TLS INVITE transactions from listed peers to a private pcap.\n"
-			"       The normal logger must be off. Prepare fixes a deadline no further than the maximum lease.\n";
+			"       Capture decrypted INVITE transactions from listed peers on secure transports (TLS/WSS) to a private pcap.\n"
+			"       The normal logger must be off. The operator chooses the deadline in prepare.\n"
+			"       The nonce is a coordination token shared by whoever prepares, starts and cancels the lease;\n"
+			"       status prints it to any CLI caller.\n";
 		return NULL;
 	case CLI_GENERATE:
 		return NULL;
