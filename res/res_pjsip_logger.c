@@ -955,7 +955,7 @@ static char *pjsip_capture_command(struct ast_cli_entry *e, int cmd, struct ast_
 			"       pjsip capture lease cancel <nonce>\n"
 			"       pjsip capture lease status\n"
 			"       Capture decrypted TLS INVITE transactions from listed peers to a private pcap.\n"
-			"       The normal logger must be off. Prepare fixes a deadline at most 60s away.\n";
+			"       The normal logger must be off. Prepare fixes a deadline no further than the maximum lease.\n";
 		return NULL;
 	case CLI_GENERATE:
 		return NULL;
@@ -989,7 +989,7 @@ static char *pjsip_capture_command(struct ast_cli_entry *e, int cmd, struct ast_
 
 static struct ast_cli_entry cli_pjsip[] = {
 	AST_CLI_DEFINE(pjsip_set_logger, "Enable/Disable PJSIP Logger Output"),
-	AST_CLI_DEFINE(pjsip_capture_command, "Manage a short-lived PJSIP evidence capture"),
+	AST_CLI_DEFINE(pjsip_capture_command, "Manage a time-limited PJSIP evidence capture"),
 };
 
 static void check_debug(void)

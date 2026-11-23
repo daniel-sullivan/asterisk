@@ -38,7 +38,11 @@ int main(int argc, char **argv)
 
 	assert(argc == 2);
 	assert(capture_deadline(60001, 1000, 1) == 60000001000LL);
-	assert(!capture_deadline(60002, 1000, 1));
+	/* The boundary is CAPTURE_MAX_MS: accepted at it, refused above it, never wrapped. */
+	assert(capture_deadline(CAPTURE_MAX_MS + 1, 1000, 1) == 1000 + CAPTURE_MAX_MS * NSEC_PER_MS);
+	assert(capture_deadline(CAPTURE_MAX_MS + 1, 1000, 1) > 1000);
+	assert(!capture_deadline(CAPTURE_MAX_MS + 2, 1000, 1));
+	assert(!capture_deadline(INT64_MAX, 1000, 1));
 	assert(!capture_deadline(1, 1000, 1));
 	assert(!capture_deadline(60001, -1, 1));
 
