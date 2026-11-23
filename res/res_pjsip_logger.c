@@ -26,6 +26,10 @@
 #include "asterisk.h"
 
 #include <netinet/in.h>	/* For IPPROTO_UDP and in6_addr */
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/uio.h>
+#include <time.h>
 
 #include <pjsip.h>
 
@@ -36,6 +40,90 @@
 #include "asterisk/cli.h"
 #include "asterisk/netsock2.h"
 #include "asterisk/acl.h"
+#include "asterisk/uuid.h"
+
+#define CAPTURE_MAX_MS 60000
+#define NSEC_PER_MS 1000000LL
+
+/* Separate from the normal logger. All fields are under its session lock. */
+struct pjsip_capture_lease {
+	char nonce[AST_UUID_STR_LEN];
+	int64_t expires_ns;
+	struct ast_ha *peers;
+	int fd;
+};
+
+static struct pjsip_capture_lease capture_lease = { .fd = -1 };
+
+static void capture_close(struct pjsip_capture_lease *lease)
+{
+	if (lease->fd >= 0) {
+		close(lease->fd);
+	}
+	ast_free_ha(lease->peers);
+	*lease = (struct pjsip_capture_lease) { .fd = -1 };
+}
+
+static int64_t capture_time_ns(clockid_t clock)
+{
+	struct timespec now;
+
+	if (clock_gettime(clock, &now)) {
+		return -1;
+	}
+	return now.tv_sec * 1000000000LL + now.tv_nsec;
+}
+
+static int64_t capture_deadline(int64_t requested_ms, int64_t earliest_mono_ns, int64_t wall_ns)
+{
+	int64_t remaining_ms;
+	if (earliest_mono_ns < 0 || wall_ns < 0) {
+		return 0;
+	}
+	/* Round wall time up; time between the samples can only shorten the lease. */
+	remaining_ms = requested_ms - (wall_ns + NSEC_PER_MS - 1) / NSEC_PER_MS;
+	if (remaining_ms <= 0 || remaining_ms > CAPTURE_MAX_MS) {
+		return 0;
+	}
+	return earliest_mono_ns + remaining_ms * NSEC_PER_MS;
+}
+
+static int capture_is_live(struct pjsip_capture_lease *lease, int64_t now_ns)
+{
+	if (!lease->nonce[0]) {
+		return 0;
+	}
+	if (now_ns < 0 || now_ns >= lease->expires_ns) {
+		capture_close(lease);
+		return 0;
+	}
+	return 1;
+}
+
+static int capture_can_start(struct pjsip_capture_lease *lease, const char *nonce, int64_t now_ns)
+{
+	return capture_is_live(lease, now_ns) && lease->fd < 0 && !strcmp(lease->nonce, nonce);
+}
+
+static int capture_cancel(struct pjsip_capture_lease *lease, const char *nonce)
+{
+	if (!lease->nonce[0] || strcmp(lease->nonce, nonce)) {
+		return 0;
+	}
+	capture_close(lease);
+	return 1;
+}
+
+static void capture_write_record(struct pjsip_capture_lease *lease, const struct iovec *record,
+	int count, size_t len)
+{
+	/* The cutoff is checked at admission to the unbuffered write, not by a timer. */
+	if (lease->fd >= 0 && capture_is_live(lease, capture_time_ns(CLOCK_MONOTONIC))
+		&& writev(lease->fd, record, count) != (ssize_t) len) {
+		ast_log(LOG_WARNING, "Writing SIP capture record failed; capture closed\n");
+		capture_close(lease);
+	}
+}
 
 /*! \brief PCAP Header */
 struct pcap_header {
@@ -55,6 +143,28 @@ struct pcap_record_header {
 	uint32_t incl_len;	/*! \brief Length of packet as saved in the file */
 	uint32_t orig_len;	/*! \brief Length of packet as sent over network */
 };
+
+static const struct pcap_header pjsip_pcap_header = {
+	.magic_number = 0xa1b2c3d4,
+	.version_major = 2,
+	.version_minor = 4,
+	.snaplen = 65535,
+	.network = 1, /* Ethernet can carry both IPv4 and IPv6 records. */
+};
+
+static int capture_open_pcap(const char *filename)
+{
+	int fd = open(filename, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, S_IRUSR | S_IWUSR);
+	if (fd < 0) {
+		return -1;
+	}
+	if (fchmod(fd, S_IRUSR | S_IWUSR)
+		|| write(fd, &pjsip_pcap_header, sizeof(pjsip_pcap_header)) != sizeof(pjsip_pcap_header)) {
+		close(fd);
+		return -1;
+	}
+	return fd;
+}
 
 /*! \brief PCAP Ethernet Header */
 struct pcap_ethernet_header {
@@ -219,8 +329,9 @@ static inline int pjsip_log_test_filter(const struct pjsip_logger_session *sessi
 	}
 }
 
-static void pjsip_logger_write_to_pcap(struct pjsip_logger_session *session, const char *msg, size_t msg_len,
-	pj_sockaddr *source, pj_sockaddr *destination)
+/* Lease callers hold the session write lock. */
+static void pjsip_logger_write_to_pcap(struct pjsip_logger_session *session, struct pjsip_capture_lease *lease,
+	const char *msg, size_t msg_len, pj_sockaddr *source, pj_sockaddr *destination)
 {
 	struct timeval now = ast_tvnow();
 	struct pcap_record_header pcap_record_header = {
@@ -239,7 +350,7 @@ static void pjsip_logger_write_to_pcap(struct pjsip_logger_session *session, con
 	};
 	void *pcap_ip_header;
 	size_t pcap_ip_header_len;
-	struct pcap_udp_header pcap_udp_header;
+	struct pcap_udp_header pcap_udp_header = { 0 };
 
 	/* Packets are always stored as UDP to simplify this logic */
 	if (source) {
@@ -285,6 +396,20 @@ static void pjsip_logger_write_to_pcap(struct pjsip_logger_session *session, con
 	/* Add up all the sizes for this record */
 	pcap_record_header.incl_len = pcap_record_header.orig_len = sizeof(pcap_ethernet_header) + pcap_ip_header_len + sizeof(pcap_udp_header) + msg_len;
 
+	if (lease) {
+		struct iovec record[] = {
+			{ &pcap_record_header, sizeof(pcap_record_header) },
+			{ &pcap_ethernet_header, sizeof(pcap_ethernet_header) },
+			{ pcap_ip_header, pcap_ip_header_len },
+			{ &pcap_udp_header, sizeof(pcap_udp_header) },
+			{ (void *) msg, msg_len },
+		};
+
+		capture_write_record(lease, record, ARRAY_LEN(record),
+			sizeof(pcap_record_header) + pcap_record_header.incl_len);
+		return;
+	}
+
 	/* We lock the logger session since we're writing these out in parts */
 	ao2_wrlock(session);
 	if (session->pcap_file) {
@@ -307,10 +432,50 @@ static void pjsip_logger_write_to_pcap(struct pjsip_logger_session *session, con
 	ao2_unlock(session);
 }
 
+static void capture_packet(pjsip_msg *sip, pjsip_transport *transport, const char *address,
+	const char *msg, size_t len, pj_sockaddr *source, pj_sockaddr *destination)
+{
+	struct ast_sockaddr peer;
+	const pjsip_method *method;
+
+	/* TLS only, and only the INVITE transactions needed for failover. */
+	if (!sip || !transport || !(transport->flag & PJSIP_TRANSPORT_SECURE) || !len) {
+		return;
+	}
+	if (sip->type == PJSIP_REQUEST_MSG) {
+		method = &sip->line.req.method;
+	} else {
+		pjsip_cseq_hdr *cseq = pjsip_msg_find_hdr(sip, PJSIP_H_CSEQ, NULL);
+		if (!cseq) {
+			return;
+		}
+		method = &cseq->method;
+	}
+	if (method->id != PJSIP_INVITE_METHOD) {
+		return;
+	}
+	ao2_rdlock(default_logger);
+	if (capture_lease.fd < 0) {
+		ao2_unlock(default_logger);
+		return;
+	}
+	ao2_unlock(default_logger);
+	ao2_wrlock(default_logger);
+	if (capture_lease.fd >= 0 && capture_is_live(&capture_lease, capture_time_ns(CLOCK_MONOTONIC))
+		&& !default_logger->enabled
+		&& ast_sockaddr_parse(&peer, address, PARSE_PORT_IGNORE)
+		&& ast_apply_ha(capture_lease.peers, &peer) == AST_SENSE_DENY) {
+		pjsip_logger_write_to_pcap(default_logger, &capture_lease, msg, len, source, destination);
+	}
+	ao2_unlock(default_logger);
+}
+
 static pj_status_t logging_on_tx_msg(pjsip_tx_data *tdata)
 {
 	char buffer[AST_SOCKADDR_BUFLEN];
 
+	capture_packet(tdata->msg, tdata->tp_info.transport, tdata->tp_info.dst_name,
+		tdata->buf.start, tdata->buf.cur - tdata->buf.start, NULL, &tdata->tp_info.dst_addr);
 	ao2_rdlock(default_logger);
 	if (!pjsip_log_test_filter(default_logger, tdata->tp_info.dst_name, tdata->tp_info.dst_port, &tdata->msg->line.req.method)) {
 		ao2_unlock(default_logger);
@@ -328,7 +493,7 @@ static pj_status_t logging_on_tx_msg(pjsip_tx_data *tdata)
 	}
 
 	if (default_logger->log_to_pcap) {
-		pjsip_logger_write_to_pcap(default_logger, tdata->buf.start, (int) (tdata->buf.cur - tdata->buf.start),
+		pjsip_logger_write_to_pcap(default_logger, NULL, tdata->buf.start, (int) (tdata->buf.cur - tdata->buf.start),
 			NULL, &tdata->tp_info.dst_addr);
 	}
 
@@ -342,6 +507,8 @@ static pj_bool_t logging_on_rx_msg(pjsip_rx_data *rdata)
 	if (!rdata->msg_info.msg) {
 		return PJ_FALSE;
 	}
+	capture_packet(rdata->msg_info.msg, rdata->tp_info.transport, rdata->pkt_info.src_name,
+		rdata->pkt_info.packet, rdata->msg_info.len, &rdata->pkt_info.src_addr, NULL);
 
 	ao2_rdlock(default_logger);
 	if (!pjsip_log_test_filter(default_logger, rdata->pkt_info.src_name, rdata->pkt_info.src_port, &rdata->msg_info.msg->line.req.method)) {
@@ -360,7 +527,7 @@ static pj_bool_t logging_on_rx_msg(pjsip_rx_data *rdata)
 	}
 
 	if (default_logger->log_to_pcap) {
-		pjsip_logger_write_to_pcap(default_logger, rdata->pkt_info.packet, rdata->msg_info.len,
+		pjsip_logger_write_to_pcap(default_logger, NULL, rdata->pkt_info.packet, rdata->msg_info.len,
 			&rdata->pkt_info.src_addr, NULL);
 	}
 
@@ -525,6 +692,9 @@ static char *pjsip_enable_logger_method(int fd, const char *arg, int add_method)
 static char *pjsip_disable_logger(int fd)
 {
 	ao2_wrlock(default_logger);
+	if (fd >= 0) {
+		capture_close(&capture_lease);
+	}
 
 	/* Default the settings back to the way they were */
 	default_logger->enabled = 0;
@@ -566,14 +736,6 @@ static char *pjsip_set_logger_verbose(int fd, const char *arg)
 
 static char *pjsip_set_logger_pcap(int fd, const char *arg)
 {
-	struct pcap_header pcap_header = {
-		.magic_number = 0xa1b2c3d4,
-		.version_major = 2,
-		.version_minor = 4,
-		.snaplen = 65535,
-		.network = 1, /* We always use ethernet so we can combine IPv4 and IPv6 in same pcap */
-	};
-
 	ao2_wrlock(default_logger);
 	ast_copy_string(default_logger->pcap_filename, arg, sizeof(default_logger->pcap_filename));
 
@@ -588,7 +750,7 @@ static char *pjsip_set_logger_pcap(int fd, const char *arg)
 		ast_cli(fd, "Failed to open file '%s' for pcap writing\n", arg);
 		return CLI_SUCCESS;
 	}
-	fwrite(&pcap_header, 1, sizeof(struct pcap_header), default_logger->pcap_file);
+	fwrite(&pjsip_pcap_header, 1, sizeof(pjsip_pcap_header), default_logger->pcap_file);
 
 	default_logger->log_to_pcap = 1;
 	ao2_unlock(default_logger);
@@ -677,8 +839,155 @@ static char *pjsip_set_logger(struct ast_cli_entry *e, int cmd, struct ast_cli_a
 	return CLI_SHOWUSAGE;
 }
 
+static char *capture_prepare(int fd, const char *deadline)
+{
+	char *end;
+	int64_t requested_ms, before_ns, now_ns, expires_ns;
+	char nonce[AST_UUID_STR_LEN];
+
+	errno = 0;
+	requested_ms = strtoll(deadline, &end, 10);
+	if (errno || !isdigit((unsigned char) deadline[0]) || *end || requested_ms <= 0) {
+		return CLI_SHOWUSAGE;
+	}
+	ao2_wrlock(default_logger);
+	before_ns = capture_time_ns(CLOCK_MONOTONIC);
+	if (capture_is_live(&capture_lease, before_ns) || default_logger->enabled) {
+		ao2_unlock(default_logger);
+		ast_cli(fd, "PJSIP capture refused: logger or lease already active\n");
+		return CLI_FAILURE;
+	}
+	expires_ns = capture_deadline(requested_ms, before_ns, capture_time_ns(CLOCK_REALTIME));
+	if (!expires_ns || !ast_uuid_generate_str(nonce, sizeof(nonce))
+		|| (now_ns = capture_time_ns(CLOCK_MONOTONIC)) < 0 || now_ns >= expires_ns) {
+		ao2_unlock(default_logger);
+		ast_cli(fd, "PJSIP capture refused: deadline or nonce unavailable\n");
+		return CLI_FAILURE;
+	}
+	ast_copy_string(capture_lease.nonce, nonce, sizeof(capture_lease.nonce));
+	capture_lease.expires_ns = expires_ns;
+	ao2_unlock(default_logger);
+	ast_cli(fd, "PJSIP capture prepared %s\n", nonce);
+	return CLI_SUCCESS;
+}
+
+static struct ast_ha *capture_parse_peers(const char *list)
+{
+	char *rest = ast_strdupa(list);
+	char *cidr;
+	struct ast_ha *peers = NULL;
+	while ((cidr = strsep(&rest, ","))) {
+		char *mask = strchr(cidr, '/');
+		char *end;
+		long bits;
+		int error = 0;
+
+		/* Numeric CIDRs only; never allow an empty list or a catch-all. */
+		if (!mask || mask[1] < '1' || mask[1] > '9') {
+			break;
+		}
+		bits = strtol(mask + 1, &end, 10);
+		if (*end || bits < 1 || bits > 128) {
+			break;
+		}
+		/* ast_apply_ha defaults to ALLOW; DENY marks the listed peers. */
+		peers = ast_append_ha("deny", cidr, peers, &error);
+		if (error || !peers) {
+			break;
+		}
+	}
+	if (cidr) {
+		ast_free_ha(peers);
+		return NULL;
+	}
+	return peers;
+}
+
+static char *capture_start(int fd, const char *nonce, const char *filename, const char *peer_list)
+{
+	struct ast_ha *peers;
+	int file = -1;
+	int started = 0;
+
+	if (filename[0] != '/' || !(peers = capture_parse_peers(peer_list))) {
+		return CLI_SHOWUSAGE;
+	}
+	ao2_wrlock(default_logger);
+	if (capture_can_start(&capture_lease, nonce, capture_time_ns(CLOCK_MONOTONIC))
+		&& !default_logger->enabled) {
+		file = capture_open_pcap(filename);
+		if (file >= 0) {
+			if (capture_is_live(&capture_lease, capture_time_ns(CLOCK_MONOTONIC))) {
+				capture_lease.fd = file;
+				capture_lease.peers = peers;
+				started = 1;
+			} else {
+				close(file);
+			}
+		}
+		if (!started) {
+			capture_close(&capture_lease);
+		}
+	}
+	ao2_unlock(default_logger);
+	if (!started) {
+		ast_free_ha(peers);
+		ast_cli(fd, "PJSIP capture refused: inactive nonce, logger enabled or file unavailable\n");
+		return CLI_FAILURE;
+	}
+	ast_cli(fd, "PJSIP capture started %s\n", nonce);
+	return CLI_SUCCESS;
+}
+
+static char *pjsip_capture_command(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a)
+{
+	int live, active, normal;
+	char nonce[AST_UUID_STR_LEN];
+
+	switch (cmd) {
+	case CLI_INIT:
+		e->command = "pjsip capture lease {prepare|start|cancel|status}";
+		e->usage =
+			"Usage: pjsip capture lease prepare <absolute-unix-ms>\n"
+			"       pjsip capture lease start <nonce> <new-absolute-pcap-path> <cidr[,cidr...]>\n"
+			"       pjsip capture lease cancel <nonce>\n"
+			"       pjsip capture lease status\n"
+			"       Capture decrypted TLS INVITE transactions from listed peers to a private pcap.\n"
+			"       The normal logger must be off. Prepare fixes a deadline at most 60s away.\n";
+		return NULL;
+	case CLI_GENERATE:
+		return NULL;
+	}
+	if (a->argc == 5 && !strcasecmp(a->argv[3], "prepare")) {
+		return capture_prepare(a->fd, a->argv[4]);
+	}
+	if (a->argc == 7 && !strcasecmp(a->argv[3], "start")) {
+		return capture_start(a->fd, a->argv[4], a->argv[5], a->argv[6]);
+	}
+	if (a->argc == 5 && !strcasecmp(a->argv[3], "cancel")) {
+		ao2_wrlock(default_logger);
+		active = capture_cancel(&capture_lease, a->argv[4]);
+		ao2_unlock(default_logger);
+		ast_cli(a->fd, active ? "PJSIP capture cancelled\n" : "PJSIP capture nonce inactive\n");
+		return CLI_SUCCESS;
+	}
+	if (a->argc == 4 && !strcasecmp(a->argv[3], "status")) {
+		ao2_wrlock(default_logger);
+		live = capture_is_live(&capture_lease, capture_time_ns(CLOCK_MONOTONIC));
+		active = capture_lease.fd >= 0;
+		normal = default_logger->enabled;
+		ast_copy_string(nonce, capture_lease.nonce, sizeof(nonce));
+		ao2_unlock(default_logger);
+		ast_cli(a->fd, "PJSIP capture %s%s%s; normal logger %s\n",
+			active ? "active" : live ? "prepared" : "off", live ? " " : "", nonce, normal ? "on" : "off");
+		return CLI_SUCCESS;
+	}
+	return CLI_SHOWUSAGE;
+}
+
 static struct ast_cli_entry cli_pjsip[] = {
-	AST_CLI_DEFINE(pjsip_set_logger, "Enable/Disable PJSIP Logger Output")
+	AST_CLI_DEFINE(pjsip_set_logger, "Enable/Disable PJSIP Logger Output"),
+	AST_CLI_DEFINE(pjsip_capture_command, "Manage a short-lived PJSIP evidence capture"),
 };
 
 static void check_debug(void)
@@ -765,6 +1074,9 @@ static int unload_module(void)
 
 	ast_sorcery_observer_remove(
 		ast_sip_get_sorcery(), "global", &global_observer);
+	ao2_wrlock(default_logger);
+	capture_close(&capture_lease);
+	ao2_unlock(default_logger);
 
 	ao2_cleanup(default_logger);
 	default_logger = NULL;
